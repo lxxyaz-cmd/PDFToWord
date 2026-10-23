@@ -10,22 +10,40 @@ an already produced Word document and needs ``python-docx`` alone.
 
 from __future__ import annotations
 
+import base64
+import contextlib
 import sys
 import types
 from pathlib import Path
 
-for missing in ("pymupdf", "pdf2docx"):
-    if missing not in sys.modules:
-        stub = types.ModuleType(missing)
+# The smallest valid PNG; the picture only has to exist, not to look like
+# anything, for the geometry checks.
+SMALL_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+def ensure_module(name: str) -> bool:
+    """Import the real module, or install a stub and report that it is fake."""
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        stub = types.ModuleType(name)
         stub.open = lambda *args, **kwargs: None  # type: ignore[attr-defined]
         stub.Converter = object  # type: ignore[attr-defined]
-        sys.modules[missing] = stub
+        sys.modules[name] = stub
+        return False
+
+
+HAS_PYMUPDF = ensure_module("pymupdf")
+ensure_module("pdf2docx")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "editable_engine"))
 
 from docx import Document  # noqa: E402
 from docx.oxml import parse_xml  # noqa: E402
-from docx.oxml.ns import nsdecls  # noqa: E402
+from docx.oxml.ns import nsdecls, qn  # noqa: E402
+from docx.shared import Pt  # noqa: E402
 
 import editable_converter as engine  # noqa: E402
 
@@ -156,7 +174,17 @@ def test_compact_wide_tables_handles_nested(tmp_path: Path):
     check(path.exists(), "宽表压缩支持嵌套表格且不抛异常")
 
 
-def stub_engines(source_numbers, layout_body, legacy_body=None):
+PATCHED = (
+    "source_numeric_tokens",
+    "image_only_pages",
+    "convert_layout",
+    "convert_legacy",
+    "repair_and_normalize_docx",
+)
+
+
+@contextlib.contextmanager
+def stub_engines(source_numbers, layout_body, legacy_body=None, scanned_pages=()):
     """Replace the PDF side of the pipeline with fixed text."""
 
     def make(body):
@@ -169,7 +197,9 @@ def stub_engines(source_numbers, layout_body, legacy_body=None):
 
         return run
 
+    saved = {name: getattr(engine, name) for name in PATCHED}
     engine.source_numeric_tokens = lambda input_path: list(source_numbers)
+    engine.image_only_pages = lambda input_path: list(scanned_pages)
     engine.convert_layout = make(layout_body)
     engine.convert_legacy = lambda input_path, output_path: (
         make(legacy_body if legacy_body is not None else layout_body)(input_path, output_path)[0]
@@ -178,14 +208,17 @@ def stub_engines(source_numbers, layout_body, legacy_body=None):
         {"repaired_glyphs": 0, "suspicious_glyphs": 0},
         engine.document_text(Document(path)),
     )
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(engine, name, value)
 
 
 def test_convert_delivers_document_with_warning(tmp_path: Path):
-    original = (engine.source_numeric_tokens, engine.convert_layout,
-                engine.convert_legacy, engine.repair_and_normalize_docx)
-    try:
-        # Every value is present, only one repeated occurrence is gone.
-        stub_engines(["7"] * 8 + [str(n) for n in range(100, 160)], "7 " + " ".join(str(n) for n in range(100, 160)))
+    # Every value is present, only one repeated occurrence is gone.
+    with stub_engines(["7"] * 8 + [str(n) for n in range(100, 160)],
+                      "7 " + " ".join(str(n) for n in range(100, 160))):
         output = tmp_path / "warned.docx"
         report = engine.convert(Path("source.pdf"), output)
         check(output.exists(), "少量数字对不上时仍然输出 Word 文件")
@@ -195,17 +228,24 @@ def test_convert_delivers_document_with_warning(tmp_path: Path):
             len(report["warnings"]) == 1 and "出现次数" in report["warnings"][0],
             f"超出计数容差时给出提示而不是失败，实际={report['warnings']}",
         )
-    finally:
-        (engine.source_numeric_tokens, engine.convert_layout,
-         engine.convert_legacy, engine.repair_and_normalize_docx) = original
+
+
+def test_scanned_pdf_warns_that_text_is_not_editable(tmp_path: Path):
+    # A scan has no text at all, so every numeric and glyph gate passes with a
+    # perfect score. The user still has to be told the Word file is pictures.
+    with stub_engines([], "", scanned_pages=[1, 2]):
+        output = tmp_path / "scanned.docx"
+        report = engine.convert(Path("scan.pdf"), output)
+        check(output.exists(), "扫描件仍然输出 Word 文件")
+        check(report["image_only_pages"] == [1, 2], f"记录无文字层的页码，实际={report.get('image_only_pages')}")
+        warning = " ".join(report["warnings"])
+        check("没有文字层" in warning, f"提示说明没有文字层，实际={report['warnings']}")
+        check("OCR" in warning, f"提示说明本版本不含 OCR，实际={report['warnings']}")
 
 
 def test_convert_still_fails_on_real_data_loss(tmp_path: Path):
-    original = (engine.source_numeric_tokens, engine.convert_layout,
-                engine.convert_legacy, engine.repair_and_normalize_docx)
-    try:
-        # The subset-font case: the numbers never arrive in the document.
-        stub_engines([str(n) for n in range(100, 160)], "文本没有任何数字")
+    # The subset-font case: the numbers never arrive in the document.
+    with stub_engines([str(n) for n in range(100, 160)], "文本没有任何数字"):
         output = tmp_path / "failed.docx"
         try:
             engine.convert(Path("source.pdf"), output)
@@ -213,9 +253,189 @@ def test_convert_still_fails_on_real_data_loss(tmp_path: Path):
         except ValueError as exc:
             check("数字完整性校验未通过" in str(exc), f"报错信息说明原因，实际={exc}")
             check(not output.exists(), "校验失败时不写出残缺的 Word 文件")
+
+
+def page_sized_picture_document(tmp_path: Path):
+    """A4 page holding one picture sized to the whole sheet, margins ignored."""
+    document = Document()
+    section = document.sections[0]
+    engine.configure_section(section, 595.0, 841.0)
+    image = tmp_path / "page.png"
+    image.write_bytes(SMALL_PNG)
+    document.add_paragraph().add_run().add_picture(
+        str(image), width=Pt(595), height=Pt(841)
+    )
+    return document
+
+
+def test_fit_images_to_page(tmp_path: Path):
+    document = page_sized_picture_document(tmp_path)
+    usable_width, usable_height = engine.section_usable_box(document.sections[0])
+    check(
+        (round(usable_width), round(usable_height)) == (531, 777),
+        f"可用区按页面尺寸减边距计算，实际={usable_width:.0f}x{usable_height:.0f}",
+    )
+
+    before = document.inline_shapes[0]
+    check(
+        before.height.pt > usable_height,
+        f"修复前图片高于可用区（{before.height.pt:.0f} > {usable_height:.0f}），会溢出到下一页",
+    )
+
+    resized = engine.fit_images_to_page(document)
+    shape = document.inline_shapes[0]
+    check(resized == 1, f"超出可用区的图片被缩放，实际处理 {resized} 张")
+    check(
+        shape.width.pt <= usable_width + 0.5 and shape.height.pt <= usable_height + 0.5,
+        f"缩放后落在可用区内，实际={shape.width.pt:.0f}x{shape.height.pt:.0f}",
+    )
+    check(
+        abs(shape.width.pt / shape.height.pt - 595 / 841) < 0.01,
+        "缩放保持原始宽高比",
+    )
+
+    # A picture that already fits must not be touched.
+    check(engine.fit_images_to_page(document) == 0, "再次运行不会重复缩放")
+
+
+def test_shrink_docx_images(tmp_path: Path):
+    if not HAS_PYMUPDF:
+        print("SKIP  JPEG 重编码（本环境没有 pymupdf）")
+        return
+    import pymupdf
+
+    # A photo-like page: smooth gradient plus dither, the shape of a scan.
+    width = height = 600
+    samples = bytearray()
+    for y in range(height):
+        for x in range(width):
+            base = (x * 255 // width + y * 255 // height) // 2
+            samples += bytes(((base + x % 7) % 256, (base + y % 5) % 256, base))
+    pixmap = pymupdf.Pixmap(pymupdf.csRGB, width, height, bytes(samples), False)
+    picture = tmp_path / "scan.png"
+    picture.write_bytes(pixmap.tobytes("png"))
+
+    document = Document()
+    document.add_paragraph().add_run().add_picture(str(picture), width=Pt(400))
+    output = tmp_path / "scan.docx"
+    document.save(output)
+    before = output.stat().st_size
+
+    saved_min = engine.IMAGE_RECOMPRESS_MIN_BYTES
+    try:
+        # Exercise the rewrite regardless of how well this fixture compresses.
+        engine.IMAGE_RECOMPRESS_MIN_BYTES = 1024
+        report = engine.shrink_docx_images(output)
     finally:
-        (engine.source_numeric_tokens, engine.convert_layout,
-         engine.convert_legacy, engine.repair_and_normalize_docx) = original
+        engine.IMAGE_RECOMPRESS_MIN_BYTES = saved_min
+
+    check(report["recompressed_images"] == 1, f"图片被重编码，实际={report}")
+    check(report["bytes_saved"] > 0, f"确实变小了，实际省下 {report['bytes_saved']} 字节")
+    check(output.stat().st_size < before, "docx 整体体积下降")
+
+    import zipfile
+
+    with zipfile.ZipFile(output) as archive:
+        media = [n for n in archive.namelist() if n.startswith("word/media/")]
+        content_types = archive.read("[Content_Types].xml").decode("utf-8")
+    check(media == ["word/media/image1.jpeg"], f"媒体文件改名为 .jpeg，实际={media}")
+    check('Extension="jpeg"' in content_types, "[Content_Types].xml 登记了 jpeg")
+
+    reopened = Document(output)
+    check(len(reopened.inline_shapes) == 1, "重写后的 docx 仍可打开且图片还在")
+
+
+def test_repair_ocr_text():
+    # Exactly what the Windows engine returns for a scanned quotation.
+    check(engine.repair_ocr_text("240 ， 00") == "240.00", "全角逗号还原为小数点")
+    check(engine.repair_ocr_text("130 ． 00") == "130.00", "全角句号还原为小数点")
+    check(engine.repair_ocr_text("960 · 00") == "960.00", "间隔号还原为小数点")
+    code = engine.repair_ocr_text("CZCT7001 一 01 一 30 一 001")
+    check(code == "CZCT7001-01-30-001", f"汉字一还原为连字符，实际={code}")
+    name = engine.repair_ocr_text("天 津 鑫 地 机 械")
+    check(name == "天津鑫地机械", f"去掉汉字之间的空格，实际={name}")
+    # A real "一" between Chinese characters must survive.
+    check(engine.repair_ocr_text("第 一 页") == "第一页", "中文里的「一」不受影响")
+
+
+def fake_ocr_tool(tmp_path: Path) -> str:
+    """A stand-in for the C++ shell that writes the JSON it would produce."""
+    script = tmp_path / "fake_ocr.py"
+    script.write_text(
+        "import json, sys\n"
+        "out = sys.argv[sys.argv.index('--ocr') + 2]\n"
+        "json.dump({'ok': True, 'width': 2480, 'height': 3505, 'lines': ["
+        "{'text': '240 \\uff0c 00', 'words': [{'t': '240', 'x': 100.0, 'y': 500.0}]},"
+        "{'text': '\\u5929 \\u6d25 \\u946b \\u5730', 'words': [{'t': '\\u5929', 'x': 90.0, 'y': 100.0}]}"
+        "]}, open(out, 'w', encoding='utf-8'))\n",
+        encoding="utf-8",
+    )
+    shim = tmp_path / "fake_ocr.cmd"
+    shim.write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="ascii")
+    return str(shim)
+
+
+def test_ocr_text_layer(tmp_path: Path):
+    if not HAS_PYMUPDF:
+        print("SKIP  OCR 文字层（本环境没有 pymupdf）")
+        return
+    import pymupdf
+
+    # A one page PDF with no text layer, like a scan.
+    source = tmp_path / "scan.pdf"
+    pdf = pymupdf.open()
+    page = pdf.new_page(width=595, height=841)
+    page.insert_image(page.rect, pixmap=pymupdf.Pixmap(pymupdf.csRGB, 40, 56, bytes(40 * 56 * 3), False))
+    pdf.save(source)
+    pdf.close()
+
+    # The document the layout engine would have produced for it.
+    picture = Document()
+    engine.configure_section(picture.sections[0], 595.0, 841.0)
+    image = tmp_path / "page.png"
+    image.write_bytes(SMALL_PNG)
+    picture.add_paragraph().add_run().add_picture(str(image), width=Pt(595), height=Pt(841))
+    output = tmp_path / "scan.docx"
+    picture.save(output)
+
+    report = engine.add_ocr_text_layer(output, source, [1], fake_ocr_tool(tmp_path), tmp_path)
+    check(report["ocr_error"] == "", f"OCR 调用无错误，实际={report['ocr_error']}")
+    check(report["ocr_pages"] == [1], f"记录识别过的页码，实际={report['ocr_pages']}")
+    check(report["ocr_lines"] == 2, f"记录识别行数，实际={report['ocr_lines']}")
+
+    rebuilt = Document(output)
+    text = engine.document_text(rebuilt)
+    body = rebuilt.element.body
+    check(len(list(body.iter(qn("wp:anchor")))) == 1, "页面图片改为锚定在纸张上的浮动图片")
+    check(len(list(body.iter(qn("wp:inline")))) == 0, "不再有内联图片")
+    check("240.00" in text, f"文字层写入修复后的金额，实际={text!r}")
+    check("天津鑫地" in text, f"文字层写入中文，实际={text!r}")
+    # Reading order comes from the word boxes, not from the engine's own order.
+    check(text.index("天津鑫地") < text.index("240.00"), "按词框坐标重排阅读顺序")
+
+
+def test_ocr_failure_keeps_the_document(tmp_path: Path):
+    if not HAS_PYMUPDF:
+        print("SKIP  OCR 失败处理（本环境没有 pymupdf）")
+        return
+    import pymupdf
+
+    source = tmp_path / "scan2.pdf"
+    pdf = pymupdf.open()
+    pdf.new_page(width=595, height=841)
+    pdf.save(source)
+    pdf.close()
+
+    document = Document()
+    engine.configure_section(document.sections[0], 595.0, 841.0)
+    document.add_paragraph("原有内容")
+    output = tmp_path / "scan2.docx"
+    document.save(output)
+
+    report = engine.add_ocr_text_layer(output, source, [1], str(tmp_path / "missing.cmd"), tmp_path)
+    check(report["ocr_pages"] == [], "OCR 工具不存在时不声称识别过")
+    check(bool(report["ocr_error"]), f"记录失败原因，实际={report['ocr_error']!r}")
+    check("原有内容" in engine.document_text(Document(output)), "失败时文档保持原样")
 
 
 def main() -> int:
@@ -230,8 +450,14 @@ def main() -> int:
         test_tolerance_thresholds()
         test_repair_walks_nested_content(tmp_path)
         test_compact_wide_tables_handles_nested(tmp_path)
+        test_fit_images_to_page(tmp_path)
+        test_shrink_docx_images(tmp_path)
         test_convert_delivers_document_with_warning(tmp_path)
+        test_scanned_pdf_warns_that_text_is_not_editable(tmp_path)
         test_convert_still_fails_on_real_data_loss(tmp_path)
+        test_repair_ocr_text()
+        test_ocr_text_layer(tmp_path)
+        test_ocr_failure_keeps_the_document(tmp_path)
 
     if FAILURES:
         print(f"\n{len(FAILURES)} 项失败")

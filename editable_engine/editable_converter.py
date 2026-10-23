@@ -13,8 +13,10 @@ import io
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import zipfile
 import traceback
 import unicodedata
 from pathlib import Path
@@ -25,8 +27,8 @@ from docx import Document
 from docx.enum.section import WD_ORIENT, WD_SECTION
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
+from docx.oxml import OxmlElement, parse_xml
+from docx.oxml.ns import nsdecls, qn
 from docx.shared import Inches, Pt, RGBColor
 from docx.table import Table
 from docx.text.run import Run
@@ -415,6 +417,164 @@ def add_page_fallback(document: Document, page, usable_width: float, usable_heig
     paragraph.add_run().add_picture(io.BytesIO(data), width=Pt(width), height=Pt(height))
 
 
+EMU_PER_PT = 12700
+# A scan re-encoded as PNG is several times larger than the JPEG it came from.
+# Only sizeable images are worth re-compressing; icons and line art are left
+# alone, where PNG is both smaller and sharper.
+IMAGE_RECOMPRESS_MIN_BYTES = 300 * 1024
+IMAGE_RECOMPRESS_QUALITY = 82
+IMAGE_RECOMPRESS_MIN_GAIN = 0.25
+
+
+def section_usable_box(section) -> tuple[float, float]:
+    """Width and height in points that content can actually occupy."""
+    width = float(section.page_width.pt) - float(section.left_margin.pt) - float(section.right_margin.pt)
+    height = float(section.page_height.pt) - float(section.top_margin.pt) - float(section.bottom_margin.pt)
+    return max(36.0, width), max(36.0, height)
+
+
+def body_blocks_by_section(document):
+    """Yield ``(block_element, index, section)`` for every top level body block.
+
+    A section break lives in the last paragraph of the section it closes, so
+    walking the body in order is the only way to tell which page geometry a
+    given picture will be laid out on.
+    """
+    sections = document.sections
+    if not sections:
+        return
+    index = 0
+    for child in document.element.body:
+        if child.tag == qn("w:sectPr"):
+            continue
+        position = min(index, len(sections) - 1)
+        yield child, position, sections[position]
+        if child.tag == qn("w:p"):
+            properties = child.find(qn("w:pPr"))
+            if properties is not None and properties.find(qn("w:sectPr")) is not None:
+                index += 1
+
+
+def fit_images_to_page(document) -> int:
+    """Shrink pictures that do not fit between the margins.
+
+    The layout engine sizes a full page scan to the whole paper size, margins
+    included. Word then pushes the picture past the bottom margin and every
+    source page turns into two Word pages. Scaling the picture down to the
+    usable box keeps one page per page.
+    """
+    resized = 0
+    for block, _, section in body_blocks_by_section(document):
+        max_width, max_height = section_usable_box(section)
+        for drawing in block.iter(qn("w:drawing")):
+            for extent in drawing.iter(qn("wp:extent")):
+                try:
+                    cx, cy = int(extent.get("cx")), int(extent.get("cy"))
+                except (TypeError, ValueError):
+                    continue
+                width, height = cx / EMU_PER_PT, cy / EMU_PER_PT
+                if width <= 0 or height <= 0:
+                    continue
+                scale = min(1.0, max_width / width, max_height / height)
+                if scale > 0.999:
+                    continue
+                new_cx, new_cy = int(cx * scale), int(cy * scale)
+                extent.set("cx", str(new_cx))
+                extent.set("cy", str(new_cy))
+                for ext in drawing.iter(qn("a:ext")):
+                    ext.set("cx", str(new_cx))
+                    ext.set("cy", str(new_cy))
+                resized += 1
+    return resized
+
+
+def jpeg_version(data: bytes) -> bytes | None:
+    """Re-encode one image as JPEG, or return None when that is a bad idea."""
+    try:
+        pixmap = pymupdf.Pixmap(data)
+    except Exception:
+        return None
+    try:
+        # Transparency cannot survive JPEG, and CMYK/greyscale separations are
+        # left to the original encoder.
+        if pixmap.alpha or pixmap.n not in (1, 3):
+            return None
+        return pixmap.tobytes("jpeg", jpg_quality=IMAGE_RECOMPRESS_QUALITY)
+    except Exception:
+        return None
+
+
+def shrink_docx_images(output_path: Path) -> dict:
+    """Store large photographic images as JPEG instead of PNG.
+
+    pdf2docx re-encodes every embedded picture as PNG, which inflates a scanned
+    document several times over -- a 1 MB scan came back as a 5.4 MB DOCX. The
+    pixels are unchanged apart from JPEG quantisation; layout and text are not
+    touched at all.
+    """
+    report = {"recompressed_images": 0, "bytes_saved": 0}
+    with zipfile.ZipFile(output_path) as archive:
+        names = archive.namelist()
+        candidates = {}
+        for name in names:
+            if not name.startswith("word/media/") or not name.lower().endswith(".png"):
+                continue
+            if archive.getinfo(name).file_size < IMAGE_RECOMPRESS_MIN_BYTES:
+                continue
+            original = archive.read(name)
+            converted = jpeg_version(original)
+            if converted and len(converted) < len(original) * (1.0 - IMAGE_RECOMPRESS_MIN_GAIN):
+                candidates[name] = (converted, len(original))
+        if not candidates:
+            return report
+        renames = {name: name[: -len(".png")] + ".jpeg" for name in candidates}
+        payload = {}
+        for name in names:
+            if name in candidates:
+                continue
+            payload[name] = archive.read(name)
+
+    def patch_xml(data: bytes) -> bytes:
+        text = data.decode("utf-8")
+        for name, renamed in renames.items():
+            text = text.replace(Path(name).name, Path(renamed).name)
+        return text.encode("utf-8")
+
+    content_types = payload.get("[Content_Types].xml", b"").decode("utf-8")
+    if 'Extension="jpeg"' not in content_types:
+        content_types = content_types.replace(
+            "</Types>",
+            '<Default Extension="jpeg" ContentType="image/jpeg"/></Types>',
+            1,
+        )
+    payload["[Content_Types].xml"] = content_types.encode("utf-8")
+    for name in list(payload):
+        if name.endswith(".rels"):
+            payload[name] = patch_xml(payload[name])
+
+    temporary = output_path.with_suffix(".jpeg-pass.docx")
+    with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in payload.items():
+            archive.writestr(name, data)
+        for name, (data, original_size) in candidates.items():
+            # Images are already compressed; storing them again wastes time.
+            archive.writestr(renames[name], data, zipfile.ZIP_STORED)
+            report["recompressed_images"] += 1
+            report["bytes_saved"] += original_size - len(data)
+
+    try:
+        probe = Document(temporary)
+        if len(probe.inline_shapes) != len(Document(output_path).inline_shapes):
+            raise ValueError("inline shape count changed")
+    except Exception:
+        # Never hand back a file that cannot be reopened.
+        temporary.unlink(missing_ok=True)
+        return {"recompressed_images": 0, "bytes_saved": 0}
+
+    temporary.replace(output_path)
+    return report
+
+
 def set_run_font(run, font_name: str = BASE_FONT) -> None:
     run.font.name = font_name
     r_pr = run._element.get_or_add_rPr()
@@ -556,6 +716,7 @@ def repair_and_normalize_docx(output_path: Path) -> tuple[dict, str]:
             # from becoming square placeholders.
             set_run_font(run)
     compact_wide_tables(document)
+    resized_images = fit_images_to_page(document)
     document.save(output_path)
     # The text is taken from the in-memory document; re-opening a 180 page
     # file only to read it back again doubled the conversion time.
@@ -564,6 +725,7 @@ def repair_and_normalize_docx(output_path: Path) -> tuple[dict, str]:
     report.update({
         "repaired_glyphs": repaired_glyphs,
         "suspicious_glyphs": suspicious_glyph_count(text),
+        "resized_images": resized_images,
     })
     return report, text
 
@@ -686,6 +848,511 @@ def normalize_number(token: str) -> str:
     return text.replace(",", "").replace(" ", "").lstrip("+")
 
 
+# Windows recognises printed Chinese well, but reports every decimal point as
+# a full width comma, every hyphen as the character 一, and separates CJK
+# characters with spaces. Those substitutions are systematic, so they can be
+# undone with confidence -- measured on a real quotation, all 26 prices and all
+# 26 part numbers came back correct.
+OCR_RENDER_DPI = 300
+OCR_LANGUAGE = "zh-Hans-CN"
+OCR_TEXT_SIZE_PT = 1.0
+
+
+def repair_ocr_text(text: str) -> str:
+    """Undo the systematic punctuation damage of the Windows OCR engine."""
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+    text = re.sub(r"(?<=[0-9A-Za-z])\s+(?=[，．。·、,.\u4e00-\u9fff])", "", text)
+    text = re.sub(r"(?<=[，．。·、,.\u4e00-\u9fff])\s+(?=[0-9A-Za-z])", "", text)
+    # 240 ， 00 -> 240.00
+    text = re.sub(r"(?<=\d)[，。．·、](?=\d{1,2}(?!\d))", ".", text)
+    # CZCT7001 一 01 -> CZCT7001-01
+    text = re.sub(r"(?<=[0-9A-Za-z])一(?=[0-9A-Za-z])", "-", text)
+    return text.strip()
+
+
+def ocr_page_data(tool: str, page, work_dir: Path, index, clip=None) -> tuple[dict, str]:
+    """Recognise one page, returning its lines in reading order.
+
+    Windows OCR supplies the page layout; the bundled offline model verifies
+    ruled-table cells and recognises rectified photographs.
+    """
+    image_path = work_dir / f"ocr-page-{index}.png"
+    json_path = work_dir / f"ocr-page-{index}.json"
+    page.get_pixmap(dpi=OCR_RENDER_DPI, clip=clip).save(image_path)
+    # Remove long grid strokes before recognition: narrow cells otherwise lose
+    # digits such as 11, and WinRT can read a border as part of the number.
+    from scan_tables import detect_tables, extract_stamps, stamp_free_image
+    import cv2
+    import numpy as np
+    image = cv2.imdecode(np.fromfile(str(image_path), dtype=np.uint8), cv2.IMREAD_COLOR)
+    tables = detect_tables(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    photo = {}
+    if not tables:
+        from photo_tables import rectify_photo_table
+        flattened = rectify_photo_table(cv2.cvtColor(image,cv2.COLOR_BGR2RGB),photo)
+        if flattened is not None:
+            image = cv2.cvtColor(flattened,cv2.COLOR_RGB2BGR)
+            cv2.imencode('.png',image)[1].tofile(str(image_path))
+            tables = detect_tables(flattened)
+    recognised_image = image_path
+    if tables:
+        rgb = cv2.cvtColor(image,cv2.COLOR_BGR2RGB)
+        stamps = extract_stamps(rgb)
+        clean = cv2.cvtColor(stamp_free_image(rgb,stamps),cv2.COLOR_RGB2BGR)
+        mask = cv2.bitwise_or(tables[0]["horizontal"], tables[0]["vertical"])
+        # Only remove ruled strokes inside confirmed table bounds.
+        bounded = np.zeros_like(mask)
+        for table in tables:
+            x0, y0, x1, y1 = table["bbox"]
+            bounded[max(0,y0-3):y1+4, max(0,x0-3):x1+4] = mask[max(0,y0-3):y1+4, max(0,x0-3):x1+4]
+        clean[cv2.dilate(bounded, np.ones((3, 3), np.uint8)) > 0] = 255
+        recognised_image = work_dir / f"ocr-clean-{index}.png"
+        cv2.imencode(".png", clean)[1].tofile(str(recognised_image))
+    try:
+        subprocess.run(
+            [tool, "--ocr", str(recognised_image), str(json_path), "--ocr-language", OCR_LANGUAGE],
+            check=False,
+            capture_output=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {}, f"调用 OCR 失败：{exc}"
+    if not json_path.exists():
+        return {}, "OCR 没有返回结果"
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {}, f"OCR 结果无法解析：{exc}"
+    if not payload.get("ok"):
+        return {}, str(payload.get("error") or "OCR 不可用")
+    if photo.get('rows') and tables:
+        payload['photo_rectified'] = True
+        payload['photo_rows'] = photo['rows']
+        payload['photo_columns'] = photo['columns']
+        payload['photo_side_artwork'] = photo.get('side_artwork',[])
+    # Re-read empty numeric cells independently. Windows OCR occasionally drops
+    # a short value (notably 11/16) in an otherwise perfectly recognised row.
+    from scan_tables import cell_groups, word_box, words_text
+    if tables:
+        all_words = [w for line in payload.get("lines", []) for w in line.get("words", [])]
+        retry_count = 0
+        for table in tables:
+            xs, ys = table["xs"], table["ys"]
+            groups = set(cell_groups(table))
+            for col in range(len(xs)-1):
+                header = [w for w in all_words if xs[col] <= sum(word_box(w)[::2])/2 <= xs[col+1]
+                          and ys[0] <= (float(w['y'])+float(w['h'])/2) <= ys[1]]
+                label = words_text(header, repair_ocr_text)
+                if not any(name in label for name in ("序号", "数量", "单价", "金额", "合计")):
+                    continue
+                for row in range(1, len(ys)-1):
+                    if (row, col, row, col) not in groups or retry_count >= 20:
+                        continue
+                    present = [w for w in all_words if xs[col] <= float(w['x'])+float(w['w'])/2 <= xs[col+1]
+                               and ys[row] <= float(w['y'])+float(w['h'])/2 <= ys[row+1]]
+                    if present:
+                        continue
+                    retry_count += 1
+                    x0, y0, x1, y1 = xs[col]+7, ys[row]+7, xs[col+1]-7, ys[row+1]-7
+                    crop = clean[y0:y1, x0:x1]
+                    crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+                    crop = cv2.copyMakeBorder(crop, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=(255,255,255))
+                    crop_path = work_dir / f"cell-{index}-{row}-{col}.png"
+                    result_path = crop_path.with_suffix('.json')
+                    cv2.imencode('.png', crop)[1].tofile(str(crop_path))
+                    try:
+                        subprocess.run([tool, '--ocr', str(crop_path), str(result_path), '--ocr-language', 'en-US'],
+                                       capture_output=True, timeout=30, check=False)
+                        cell_payload = json.loads(result_path.read_text(encoding='utf-8'))
+                        for line in cell_payload.get('lines', []):
+                            if not re.fullmatch(r'[\d\s.,，．]+', str(line.get('text', ''))):
+                                continue
+                            for word in line.get('words', []):
+                                word['x'] = x0 + (float(word['x'])-20)/2
+                                word['y'] = y0 + (float(word['y'])-20)/2
+                                word['w'] = float(word['w'])/2
+                                word['h'] = float(word['h'])/2
+                            payload['lines'].append(line)
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        pass
+        # A seal can cover the strokes of 月/日. Re-read only malformed date
+        # lines at a larger scale, accepting a replacement only when the OCR
+        # explicitly returns a valid date with the same recognised year.
+        from datetime import date
+        for stamp_index,stamp in enumerate(stamps):
+            x0,y0,x1,y1 = stamp['bbox']
+            cy = (y0+y1)/2
+            if any(t['ys'][0] <= cy <= t['ys'][-1] for t in tables):
+                continue
+            suspicious = [line for line in payload['lines']
+                          if re.search(r'\d{4}\s*年',str(line.get('text','')))
+                          and any(y0 <= float(w['y']) <= y1 for w in line.get('words',[]))
+                          and not re.fullmatch(r'\d{4}年\d{1,2}月\d{1,2}日',
+                                               words_text(line.get('words',[]),repair_ocr_text))]
+            if not suspicious:
+                continue
+            padding = max(40,round((x1-x0)*.35))
+            left,top = max(0,x0-padding),max(0,y0-40)
+            right,bottom = min(clean.shape[1],x1+padding),min(clean.shape[0],y1+40)
+            crop = cv2.resize(clean[top:bottom,left:right],None,fx=2,fy=2,interpolation=cv2.INTER_CUBIC)
+            crop_path = work_dir/f'stamp-date-{index}-{stamp_index}.png'
+            result_path = crop_path.with_suffix('.json')
+            cv2.imencode('.png',crop)[1].tofile(str(crop_path))
+            try:
+                subprocess.run([tool,'--ocr',str(crop_path),str(result_path),'--ocr-language',OCR_LANGUAGE],
+                               capture_output=True,timeout=30,check=False)
+                retry = json.loads(result_path.read_text(encoding='utf-8'))
+                for line in retry.get('lines',[]):
+                    value = words_text(line.get('words',[]),repair_ocr_text)
+                    match = re.fullmatch(r'(\d{4})年(\d{1,2})月(\d{1,2})日',value)
+                    if not match:
+                        continue
+                    date(*(int(part) for part in match.groups()))
+                    original = next((old for old in suspicious if match[1] in str(old.get('text',''))),None)
+                    if original is None:
+                        continue
+                    for word in line.get('words',[]):
+                        word['x'] = left+float(word['x'])/2
+                        word['y'] = top+float(word['y'])/2
+                        word['w'] = float(word['w'])/2
+                        word['h'] = float(word['h'])/2
+                    payload['lines'].remove(original)
+                    suspicious.remove(original)
+                    payload['lines'].append(line)
+            except (OSError,ValueError,subprocess.SubprocessError):
+                pass
+    if payload.get('photo_rectified'):
+        from photo_ocr import recognize_grid
+        photo_result=recognize_grid(clean,tables[0],payload,repair_ocr_text)
+        for key in ('photo_rectified','photo_rows','photo_columns','photo_side_artwork'):
+            photo_result[key]=payload[key]
+        payload=photo_result
+    elif tables:
+        from cell_ocr import verify_cells
+        try:
+            payload = verify_cells(clean,tables,payload,repair_ocr_text,stamps=stamps)
+        except Exception as exc:
+            # Preserve the first reading, but never silently report a verified
+            # result when the independent recognizer was unavailable.
+            payload['cell_ocr_error'] = f'单元格复核失败：{type(exc).__name__}: {exc}'
+    return payload, ""
+
+
+def collect_cell_ocr_report(report: dict, payload: dict, page: int) -> None:
+    report['cell_ocr_checked'] = report.get('cell_ocr_checked',0)+payload.get('cell_ocr_checked',0)
+    for key in ('cell_ocr_changes','cell_ocr_issues'):
+        report.setdefault(key,[]).extend(dict(item,page=page) for item in payload.get(key,[]))
+    if payload.get('cell_ocr_error'):
+        report.setdefault('cell_ocr_errors',[]).append(payload['cell_ocr_error'])
+
+
+def ocr_lines(payload: dict) -> list[str]:
+    # Sort by the first word of each line: the engine returns lines in its own
+    # order, which jumbles columns together.
+    entries = []
+    for line in payload.get("lines") or []:
+        words = line.get("words") or []
+        if not words:
+            continue
+        top = min(float(word.get("y", 0.0)) for word in words)
+        left = min(float(word.get("x", 0.0)) for word in words)
+        text = repair_ocr_text(str(line.get("text") or ""))
+        if text:
+            entries.append((round(top / 12.0), left, text))
+    entries.sort()
+    return [text for _, _, text in entries]
+
+
+def ocr_page_lines(tool: str, page, work_dir: Path, index: int) -> tuple[list[str], str]:
+    payload, error = ocr_page_data(tool, page, work_dir, index)
+    return ocr_lines(payload), error
+
+
+def float_picture_over_page(paragraph_element, width_pt: float, height_pt: float) -> bool:
+    """Turn an inline page picture into one pinned over the whole sheet.
+
+    The scan then covers the paper exactly as it did in the PDF, and the
+    recognised text sits underneath it: the page looks untouched, but the words
+    can be searched, selected and copied, and deleting the picture reveals them.
+    """
+    for drawing in paragraph_element.iter(qn("w:drawing")):
+        inline = drawing.find(qn("wp:inline"))
+        if inline is None:
+            continue
+        graphic = inline.find(qn("a:graphic"))
+        if graphic is None:
+            continue
+        cx, cy = int(width_pt * EMU_PER_PT), int(height_pt * EMU_PER_PT)
+        anchor = parse_xml(
+            f"<wp:anchor {nsdecls('wp', 'a', 'r')} distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\""
+            " simplePos=\"0\" relativeHeight=\"2\" behindDoc=\"0\" locked=\"0\""
+            " layoutInCell=\"1\" allowOverlap=\"1\">"
+            "<wp:simplePos x=\"0\" y=\"0\"/>"
+            "<wp:positionH relativeFrom=\"page\"><wp:posOffset>0</wp:posOffset></wp:positionH>"
+            "<wp:positionV relativeFrom=\"page\"><wp:posOffset>0</wp:posOffset></wp:positionV>"
+            f"<wp:extent cx=\"{cx}\" cy=\"{cy}\"/>"
+            "<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>"
+            "<wp:wrapNone/>"
+            "<wp:docPr id=\"900\" name=\"scanned page\"/>"
+            "<wp:cNvGraphicFramePr/>"
+            "</wp:anchor>"
+        )
+        for extent in graphic.iter(qn("a:ext")):
+            extent.set("cx", str(cx))
+            extent.set("cy", str(cy))
+        anchor.append(graphic)
+        drawing.remove(inline)
+        drawing.append(anchor)
+        return True
+    return False
+
+
+def add_ocr_paragraph(body, before, text: str) -> None:
+    paragraph = parse_xml(
+        f"<w:p {nsdecls('w')}><w:pPr>"
+        f"<w:spacing w:before=\"0\" w:after=\"0\" w:line=\"{int(OCR_TEXT_SIZE_PT * 20)}\" w:lineRule=\"exact\"/>"
+        f"<w:rPr><w:sz w:val=\"{int(OCR_TEXT_SIZE_PT * 2)}\"/></w:rPr>"
+        "</w:pPr><w:r><w:rPr>"
+        f"<w:rFonts w:ascii=\"{BASE_FONT}\" w:hAnsi=\"{BASE_FONT}\" w:eastAsia=\"{BASE_FONT}\"/>"
+        f"<w:sz w:val=\"{int(OCR_TEXT_SIZE_PT * 2)}\"/>"
+        "</w:rPr><w:t xml:space=\"preserve\"></w:t></w:r></w:p>"
+    )
+    paragraph.iter(qn("w:t")).__next__().text = text
+    before.addprevious(paragraph)
+
+
+def add_ocr_text_layer(output_path: Path, input_path: Path, pages: list[int], tool: str,
+                       work_dir: Path) -> dict:
+    """Reconstruct ruled scan tables, retaining searchable fallback for other scans."""
+    from scan_tables import rebuild_page
+    import cv2
+    import numpy as np
+
+    report = {"ocr_pages": [], "ocr_lines": 0, "ocr_error": "",
+              "ocr_table_pages": [], "ocr_tables": 0, "ocr_cell_words": 0}
+    document = Document(output_path)
+    blocks = list(body_blocks_by_section(document))
+    sections = document.sections
+    source = pymupdf.open(input_path)
+    try:
+        if len(sections) != source.page_count:
+            report["ocr_error"] = "页面与节的数量不一致，跳过文字层"
+            return report
+        by_section: dict[int, list] = {}
+        for block, position, _ in blocks:
+            by_section.setdefault(position, []).append(block)
+
+        for page_number in pages:
+            index = page_number - 1
+            if index not in by_section:
+                continue
+            payload, error = ocr_page_data(tool, source[index], work_dir, page_number)
+            lines = ocr_lines(payload)
+            if error:
+                report["ocr_error"] = error
+                break
+            if not lines:
+                continue
+            image_path = work_dir / f"ocr-page-{page_number}.png"
+            image = cv2.cvtColor(cv2.imdecode(np.fromfile(str(image_path), dtype=np.uint8),
+                                             cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+            fragment = Document()
+            configure_styles(fragment)
+            if payload.get('photo_rectified'):
+                # Phone-photo pixel dimensions are not physical paper points.
+                # Use readable A4 geometry for the reconstructed table.
+                configure_section(sections[index],595.,842.)
+            width, height = section_usable_box(sections[index])
+            tables, cell_words = rebuild_page(fragment, image, payload, width, height,
+                                              repair_ocr_text, set_table_geometry, set_run_font)
+            if tables:
+                target = by_section[index][0]
+                # Image bands belong to the fragment's package. Rebind their
+                # relationships before moving the XML into the output package.
+                for blip in fragment.element.body.iter(qn("a:blip")):
+                    rid = blip.get(qn("r:embed"))
+                    if rid:
+                        part = fragment.part.related_parts[rid]
+                        new_rid, _ = document.part.get_or_add_image(io.BytesIO(part.blob))
+                        blip.set(qn("r:embed"), new_rid)
+                for child in list(fragment.element.body):
+                    if child.tag != qn("w:sectPr"):
+                        target.addprevious(child)
+                for block in by_section[index]:
+                    properties = block.find(qn("w:pPr"))
+                    if properties is not None and properties.find(qn("w:sectPr")) is not None:
+                        # The closing section break belongs to this source page.
+                        for child in list(block):
+                            if child is not properties:
+                                block.remove(child)
+                        # pdf2docx may leave an explicit page break on the holder.
+                    else:
+                        document.element.body.remove(block)
+                report["ocr_table_pages"].append(page_number)
+                report["ocr_tables"] += tables
+                report["ocr_cell_words"] += cell_words
+                report["ocr_pages"].append(page_number)
+                report["ocr_lines"] += len(lines)
+                collect_cell_ocr_report(report,payload,page_number)
+                if payload.get('photo_rectified'):
+                    report.setdefault('photo_rectified_pages',[]).append(page_number)
+                    report['photo_ocr_engine']=payload.get('photo_ocr_engine','')
+                    report.setdefault('photo_unresolved_cells',[]).extend(
+                        [page_number,row+1,col+1] for row,col in payload.get('photo_unresolved_cells',[]))
+                continue
+            rect = source[index].rect
+            holder = None
+            for block in by_section[index]:
+                if block.find(qn("w:r")) is not None or block.iter(qn("w:drawing")):
+                    if float_picture_over_page(block, float(rect.width), float(rect.height)):
+                        holder = block
+                        break
+            target = holder if holder is not None else by_section[index][0]
+            for line in lines:
+                add_ocr_paragraph(document.element.body, target, line)
+            report["ocr_pages"].append(page_number)
+            report["ocr_lines"] += len(lines)
+        if report["ocr_pages"]:
+            used = {element.get(qn("r:embed")) for element in document.element.body.iter(qn("a:blip"))}
+            for rid, relation in list(document.part.rels.items()):
+                if relation.reltype.endswith('/image') and rid not in used:
+                    document.part.drop_rel(rid)
+            normalize_drawing_ids(document)
+            document.save(output_path)
+    finally:
+        source.close()
+    return report
+
+
+def add_embedded_image_tables(output_path: Path, input_path: Path, excluded_pages: list[int],
+                              tool: str, work_dir: Path) -> dict:
+    """Replace inline raster tables on otherwise text-bearing PDF pages."""
+    from scan_tables import detect_tables, rebuild_page
+    import numpy as np
+
+    report = {"embedded_table_pages": [], "embedded_tables": 0}
+    document = Document(output_path)
+    source = pymupdf.open(input_path)
+    try:
+        if len(document.sections) != len(source):
+            return report
+        blocks = list(body_blocks_by_section(document))
+        for index, page in enumerate(source):
+            if index + 1 in excluded_pages:
+                continue
+            candidates = []
+            for block, position, section in blocks:
+                if position != index or block.tag != qn('w:p'):
+                    continue
+                # Avoid removing prose that shares a paragraph with a picture.
+                if any((node.text or '').strip() for node in block.iter(qn('w:t'))):
+                    continue
+                for drawing in block.iter(qn('wp:inline')):
+                    extent = drawing.find(qn('wp:extent'))
+                    if extent is not None:
+                        candidates.append((block, drawing, extent, section))
+            used = set()
+            seen_rects = set()
+            for image_index, info in enumerate(page.get_image_info()):
+                rect = pymupdf.Rect(info['bbox']) & page.rect
+                key = tuple(round(v, 1) for v in rect)
+                if key in seen_rects or rect.width < 90 or rect.height < 35:
+                    continue
+                seen_rects.add(key)
+                matches = []
+                for candidate in candidates:
+                    block, drawing, extent, section = candidate
+                    if id(block) in used:
+                        continue
+                    w = int(extent.get('cx')) / EMU_PER_PT
+                    h = int(extent.get('cy')) / EMU_PER_PT
+                    difference = abs((w / h) / (rect.width / rect.height) - 1)
+                    if difference < .08:
+                        matches.append((difference, candidate))
+                if not matches:
+                    continue
+                pix = page.get_pixmap(dpi=OCR_RENDER_DPI, clip=rect)
+                image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                if not detect_tables(image):
+                    continue
+                token = f'embedded-{index+1}-{image_index}'
+                payload, error = ocr_page_data(tool, page, work_dir, token, clip=rect)
+                if error:
+                    report['embedded_ocr_error'] = error
+                    continue
+                _, (block, _, extent, section) = min(matches, key=lambda item: item[0])
+                fragment = Document()
+                configure_styles(fragment)
+                usable_width, usable_height = section_usable_box(section)
+                width = min(usable_width, int(extent.get('cx')) / EMU_PER_PT)
+                height = min(usable_height, int(extent.get('cy')) / EMU_PER_PT)
+                count, _ = rebuild_page(fragment, image, payload, width, height,
+                                         repair_ocr_text, set_table_geometry, set_run_font)
+                if not count:
+                    continue
+                collect_cell_ocr_report(report,payload,index+1)
+                for blip in fragment.element.body.iter(qn('a:blip')):
+                    rid = blip.get(qn('r:embed'))
+                    if rid:
+                        new_rid, _ = document.part.get_or_add_image(io.BytesIO(fragment.part.related_parts[rid].blob))
+                        blip.set(qn('r:embed'), new_rid)
+                for child in list(fragment.element.body):
+                    if child.tag != qn('w:sectPr'):
+                        block.addprevious(child)
+                # Preserve the section properties, but remove the original picture.
+                for child in list(block):
+                    if child.tag != qn('w:pPr'):
+                        block.remove(child)
+                used.add(id(block))
+                report['embedded_tables'] += count
+                if index + 1 not in report['embedded_table_pages']:
+                    report['embedded_table_pages'].append(index + 1)
+        if report['embedded_tables']:
+            used_rids = {node.get(qn('r:embed')) for node in document.element.iter(qn('a:blip'))}
+            for rid, relation in list(document.part.rels.items()):
+                if relation.reltype.endswith('/image') and rid not in used_rids:
+                    document.part.drop_rel(rid)
+            normalize_drawing_ids(document)
+            document.save(output_path)
+    finally:
+        source.close()
+    return report
+
+
+def normalize_drawing_ids(document) -> None:
+    """Fragment-local picture IDs must be unique in the assembled Word body."""
+    stamp = 0
+    for index,node in enumerate(document.element.iter(qn('wp:docPr')),1):
+        node.set('id',str(index))
+        if node.get('name','').startswith('PDF stamp '):
+            stamp += 1
+            node.set('name',f'PDF stamp {stamp}')
+
+
+def image_only_pages(input_path: Path) -> list[int]:
+    """Page numbers that carry no text layer at all.
+
+    Text-based quality gates cannot distinguish scans from empty pages, so
+    these pages require a separate OCR / table reconstruction pass.
+    """
+    source = pymupdf.open(input_path)
+    try:
+        pages = []
+        for index, page in enumerate(source):
+            if page.get_text("text").strip():
+                continue
+            if page.get_images() or page.get_drawings():
+                pages.append(index + 1)
+        return pages
+    finally:
+        source.close()
+
+
+def describe_pages(pages: list[int], limit: int = 20) -> str:
+    shown = "、".join(str(page) for page in pages[:limit])
+    return shown + ("…" if len(pages) > limit else "")
+
+
 def source_numeric_tokens(input_path: Path) -> list[str]:
     source = pymupdf.open(input_path)
     try:
@@ -708,6 +1375,8 @@ def docx_text_and_stats(source) -> tuple[str, dict]:
         "tables": len(document.tables),
         "images": len(document.inline_shapes),
         "sections": len(document.sections),
+        "stamp_objects": sum(node.get('name','').startswith('PDF stamp ')
+                             for node in document.element.iter(qn('wp:docPr'))),
         "orientations": orientations,
     }
 
@@ -766,7 +1435,7 @@ def evaluate_candidate(text: str, source_numbers: list[str]) -> tuple[list[str],
     )
 
 
-def convert(input_path: Path, output_path: Path) -> dict:
+def convert(input_path: Path, output_path: Path, ocr_tool: str = "") -> dict:
     """Prefer the layout engine and only fall back when its result is unusable.
 
     The layout engine keeps the original page design, the structured engine
@@ -776,6 +1445,7 @@ def convert(input_path: Path, output_path: Path) -> dict:
     beyond the tolerance aborts the conversion.
     """
     source_numbers = source_numeric_tokens(input_path)
+    scanned_pages = image_only_pages(input_path)
     distinct_numbers = {normalize_number(token) for token in source_numbers}
     allowed_missing = numeric_tolerance(len(source_numbers))
     allowed_absent = absent_tolerance(len(distinct_numbers))
@@ -858,9 +1528,69 @@ def convert(input_path: Path, output_path: Path) -> dict:
                 f"（允许 {allowed_glyphs} 个）。"
             )
 
+        if scanned_pages and ocr_tool:
+            chosen_report.update(
+                add_ocr_text_layer(chosen_path, input_path, scanned_pages, ocr_tool, temp)
+            )
+        if ocr_tool:
+            embedded_report = add_embedded_image_tables(chosen_path, input_path, scanned_pages, ocr_tool, temp)
+            chosen_report['cell_ocr_checked'] = chosen_report.get('cell_ocr_checked',0)+embedded_report.pop('cell_ocr_checked',0)
+            for key in ('cell_ocr_changes','cell_ocr_issues','cell_ocr_errors'):
+                chosen_report.setdefault(key,[]).extend(embedded_report.pop(key,[]))
+            chosen_report.update(embedded_report)
+        chosen_report.update(shrink_docx_images(chosen_path))
+        _, final_stats = docx_text_and_stats(chosen_path)
+        chosen_report.update(final_stats)
         shutil.copy2(chosen_path, output_path)
 
         warnings = []
+        if chosen_report.get('photo_rectified_pages'):
+            warnings.append(
+                f"第 {describe_pages(chosen_report['photo_rectified_pages'])} 页已校正拍照表格的折皱和阴影，"
+                "并用内置离线 OCR 重建表格；请复核原件中模糊或手写遮挡的字符。"
+            )
+        if chosen_report.get('photo_unresolved_cells'):
+            cells=chosen_report['photo_unresolved_cells']
+            warnings.append(f"拍照表格有 {len(cells)} 个单元格需人工复核（页、行、列）："+
+                            '、'.join('/'.join(map(str,cell)) for cell in cells[:12]))
+        if chosen_report.get('embedded_tables'):
+            warnings.append(
+                f"第 {describe_pages(chosen_report['embedded_table_pages'])} 页的图片已重建为 "
+                f"{chosen_report['embedded_tables']} 个可编辑 Word 表格，请复核 OCR 文字和数值。"
+            )
+        if scanned_pages:
+            page_count = chosen_report.get("sections") or len(scanned_pages)
+            scope = "整份文件" if len(scanned_pages) >= page_count else f"第 {describe_pages(scanned_pages)} 页"
+            recognised = chosen_report.get("ocr_pages") or []
+            table_pages = chosen_report.get("ocr_table_pages") or []
+            if table_pages:
+                warnings.append(
+                    f"第 {describe_pages(table_pages)} 页已从扫描图片重建 "
+                    f"{chosen_report['ocr_tables']} 个可编辑 Word 表格。"
+                    "OCR 识别可能有误，请对照原件复核金额、图号和合并单元格。"
+                )
+            remaining = [page for page in recognised if page not in table_pages]
+            if remaining:
+                warnings.append(
+                    f"第 {describe_pages(remaining)} 页没有文字层（扫描件），已用 Windows OCR 识别出 "
+                    f"{chosen_report.get('ocr_lines', 0)} 行文字并放在扫描图下方："
+                    "可以搜索和复制，删除页面上的图片即可看到并编辑这些文字。"
+                    "识别可能有误，金额和图号请对照原件核对。"
+                )
+            unrecognised = [page for page in scanned_pages if page not in recognised]
+            if unrecognised:
+                detail = chosen_report.get("ocr_error") or "本版本未启用 OCR"
+                failed_scope = "整份文件" if len(unrecognised) == page_count else f"第 {describe_pages(unrecognised)} 页"
+                warnings.append(
+                    f"{failed_scope}没有文字层（扫描件或图片页），只能按页面图片保留："
+                    f"共 {len(unrecognised)} 页的文字无法在 Word 中编辑或搜索（{detail}）。"
+                )
+        for error in chosen_report.get('cell_ocr_errors',[]):
+            warnings.append(error)
+        cell_issues = chosen_report.get('cell_ocr_issues',[])
+        if cell_issues:
+            locations = '、'.join(f"第{x['page']}页"+(x['region'] if x.get('region') else f"表{x['table']}第{x['row']}行第{x['column']}列") for x in cell_issues[:12])
+            warnings.append(f'有 {len(cell_issues)} 处单元格识别或金额关系需要人工复核：{locations}。保留实际识别值，未用算式补写。')
         if chosen_absent:
             warnings.append(
                 f"有 {len(chosen_absent)} 个数值在 Word 中完全找不到："
@@ -888,6 +1618,7 @@ def convert(input_path: Path, output_path: Path) -> dict:
 
         chosen_report["numbers_checked"] = len(source_numbers)
         chosen_report["distinct_numbers"] = len(distinct_numbers)
+        chosen_report["image_only_pages"] = scanned_pages
         chosen_report["number_mismatches"] = len(chosen_missing)
         chosen_report["absent_numbers"] = chosen_absent[:50]
         chosen_report["missing_numbers"] = chosen_missing[:50]
@@ -904,9 +1635,12 @@ def main() -> int:
     parser.add_argument("--report")
     parser.add_argument("--error-file")
     parser.add_argument("--warning-file")
+    # The C++ shell passes its own path here; it recognises scanned pages with
+    # the OCR engine built into Windows.
+    parser.add_argument("--ocr-tool", default="")
     args = parser.parse_args()
     try:
-        report = convert(Path(args.input), Path(args.output))
+        report = convert(Path(args.input), Path(args.output), args.ocr_tool)
         if args.report:
             Path(args.report).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         if args.warning_file:

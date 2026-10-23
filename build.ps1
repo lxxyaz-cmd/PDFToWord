@@ -13,6 +13,10 @@ $BuildDir = Join-Path $ProjectRoot 'build'
 $DistDir = Join-Path $ProjectRoot 'dist'
 $EmbeddedToolsDir = Join-Path $BuildDir 'embedded-tools'
 $env:Path = "$Toolchain;$env:Path"
+$LocalDependencies = Join-Path $ProjectRoot '.build-deps'
+if (Test-Path -LiteralPath $LocalDependencies) {
+    $env:PYTHONPATH = "$LocalDependencies;$env:PYTHONPATH"
+}
 
 foreach ($required in @($VcVars, $Objdump, $Python, (Join-Path $PopplerBin 'pdftoppm.exe'), (Join-Path $ProjectRoot 'editable_engine\editable_converter.py'))) {
     if (-not (Test-Path -LiteralPath $required)) {
@@ -23,10 +27,10 @@ foreach ($required in @($VcVars, $Objdump, $Python, (Join-Path $PopplerBin 'pdft
 # PyInstaller and the conversion libraries live in the runtime above, which is
 # refreshed from time to time. Say plainly what is missing instead of failing
 # later inside PyInstaller with an unrelated message.
-$MissingModules = & $Python -c "import importlib.util, sys; print(';'.join(m for m in sys.argv[1:] if importlib.util.find_spec(m) is None))" PyInstaller pymupdf pdf2docx docx
+$MissingModules = & $Python -c "import importlib.util, sys; print(';'.join(m for m in sys.argv[1:] if importlib.util.find_spec(m) is None))" PyInstaller pymupdf pdf2docx docx cv2 numpy rapidocr_onnxruntime onnxruntime PIL
 if ($LASTEXITCODE -ne 0) { throw "Cannot query the build Python: $Python" }
 if ($MissingModules) {
-    throw "Missing Python packages: $MissingModules. Install them first: & '$Python' -m pip install pyinstaller pymupdf pdf2docx python-docx"
+    throw "Missing Python packages: $MissingModules. Install them first: & '$Python' -m pip install -r requirements-build.txt"
 }
 
 if ($Clean) {
@@ -44,7 +48,8 @@ $EditableDist = Join-Path $BuildDir 'editable-dist'
 $EditableWork = Join-Path $BuildDir 'editable-work'
 & $Python -m PyInstaller --noconfirm --clean --onefile --name editable_engine `
     --exclude-module pandas --exclude-module openpyxl `
-    --exclude-module matplotlib --exclude-module scipy --exclude-module PIL `
+    --exclude-module matplotlib --exclude-module scipy --exclude-module torch --exclude-module tensorflow `
+    --collect-data rapidocr_onnxruntime `
     --distpath $EditableDist --workpath $EditableWork --specpath $BuildDir `
     (Join-Path $ProjectRoot 'editable_engine\editable_converter.py')
 if ($LASTEXITCODE -ne 0) { throw 'Editable conversion engine build failed' }
@@ -94,7 +99,7 @@ $Resource = Join-Path $BuildDir 'app.res'
 $Output = Join-Path $DistDir 'PDFToWord-Single.exe'
 $CompileCommand = 'call "' + $VcVars + '" >nul && cd /d "' + $ProjectRoot +
     '" && rc.exe /nologo /fo "' + $Resource + '" app.rc && cl.exe /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /W4 /I"' + $BuildDir + '" /Fo:"' + (Join-Path $BuildDir 'main.obj') + '" "' +
-    $Source + '" "' + $Resource + '" /Fe:"' + $Output + '" /link /SUBSYSTEM:WINDOWS ole32.lib oleaut32.lib uuid.lib comctl32.lib shell32.lib user32.lib gdi32.lib comdlg32.lib'
+    $Source + '" "' + $Resource + '" /Fe:"' + $Output + '" /link /SUBSYSTEM:WINDOWS ole32.lib oleaut32.lib uuid.lib comctl32.lib shell32.lib user32.lib gdi32.lib comdlg32.lib windowsapp.lib'
 & $env:ComSpec /d /s /c $CompileCommand
 if ($LASTEXITCODE -ne 0) { throw 'C++ compilation failed' }
 

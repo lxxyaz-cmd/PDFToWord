@@ -11,12 +11,25 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
+#include <locale>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
+
+// Windows ships an offline OCR engine. Calling it from here costs nothing at
+// all: the Python side would need the 37 MB winsdk projection for the very
+// same API, while C++/WinRT only pulls in headers and system DLLs.
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Globalization.h>
+#include <winrt/Windows.Graphics.Imaging.h>
+#include <winrt/Windows.Media.Ocr.h>
+#include <winrt/Windows.Storage.h>
+#include <winrt/Windows.Storage.Streams.h>
 
 #include "embedded_tools.h"
 
@@ -77,6 +90,9 @@ std::wstring g_cliOutput;
 int g_cliEngine = 1;
 bool g_cliMode = false;
 std::wstring g_screenshotPath;
+std::wstring g_ocrImage;
+std::wstring g_ocrOutput;
+std::wstring g_ocrLanguage = L"zh-Hans-CN";
 fs::path g_embeddedToolsDirectory;
 
 std::wstring LastErrorText(DWORD error = GetLastError()) {
@@ -112,10 +128,14 @@ void SetStatus(HWND window, const std::wstring& text) {
     PostMessageW(window, WM_STATUS_TEXT, 0, reinterpret_cast<LPARAM>(copy));
 }
 
-std::wstring ExecutableDirectory() {
+std::wstring ExecutablePath() {
     std::vector<wchar_t> path(32768);
     const DWORD len = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-    return fs::path(std::wstring(path.data(), len)).parent_path().wstring();
+    return std::wstring(path.data(), len);
+}
+
+std::wstring ExecutableDirectory() {
+    return fs::path(ExecutablePath()).parent_path().wstring();
 }
 
 void CleanupEmbeddedTools() {
@@ -519,9 +539,12 @@ bool ConvertEditableOffline(const std::wstring& input, const std::wstring& outpu
     // that only exist inside a drawing. Those no longer fail the conversion,
     // so the finished document is delivered together with the remark.
     const fs::path warningFile = tools / (L"conversion-warning-" + suffix);
+    // Pages without a text layer are recognised by calling this very
+    // executable back in --ocr mode, which keeps the OCR dependency at zero.
     const std::wstring arguments = QuoteArgument(input) + L" " + QuoteArgument(output) +
         L" --error-file " + QuoteArgument(errorFile.wstring()) +
-        L" --warning-file " + QuoteArgument(warningFile.wstring());
+        L" --warning-file " + QuoteArgument(warningFile.wstring()) +
+        L" --ocr-tool " + QuoteArgument(ExecutablePath());
     std::error_code cleanupError;
     if (!RunProcess(tool.wstring(), arguments, exitCode, error)) {
         const std::wstring detail = ReadUtf8Text(errorFile);
@@ -1226,6 +1249,124 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+std::string Utf8Encode(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int length = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()),
+                                           nullptr, 0, nullptr, nullptr);
+    if (length <= 0) return {};
+    std::string result(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()),
+                        result.data(), length, nullptr, nullptr);
+    return result;
+}
+
+std::string JsonEscape(const std::wstring& value) {
+    const std::string utf8 = Utf8Encode(value);
+    std::string escaped;
+    escaped.reserve(utf8.size() + 8);
+    for (const unsigned char ch : utf8) {
+        switch (ch) {
+        case '"': escaped += "\\\""; break;
+        case '\\': escaped += "\\\\"; break;
+        case '\n': escaped += "\\n"; break;
+        case '\r': escaped += "\\r"; break;
+        case '\t': escaped += "\\t"; break;
+        default:
+            if (ch < 0x20) {
+                char buffer[8]{};
+                std::snprintf(buffer, sizeof(buffer), "\\u%04x", ch);
+                escaped += buffer;
+            } else {
+                escaped += static_cast<char>(ch);
+            }
+        }
+    }
+    return escaped;
+}
+
+// Recognise one page image with the OCR engine built into Windows and write
+// the lines, the words and their pixel boxes as JSON. The Python engine calls
+// this back through the same executable, so no OCR library is shipped.
+int RunOcrMode() {
+    using namespace winrt;
+    using namespace winrt::Windows::Graphics::Imaging;
+    using namespace winrt::Windows::Media::Ocr;
+    using namespace winrt::Windows::Storage;
+
+    std::ostringstream json;
+    // JSON needs a dot as the decimal separator whatever the user's locale is.
+    json.imbue(std::locale::classic());
+    bool recognised = false;
+    try {
+        init_apartment(apartment_type::multi_threaded);
+        // WinRT only accepts a full Win32 path with backslashes; a forward
+        // slash from the command line is rejected as an invalid character.
+        const std::wstring imagePath =
+            fs::absolute(fs::path(g_ocrImage)).lexically_normal().make_preferred().wstring();
+        const auto file = StorageFile::GetFileFromPathAsync(imagePath).get();
+        const auto stream = file.OpenAsync(FileAccessMode::Read).get();
+        const auto decoder = BitmapDecoder::CreateAsync(stream).get();
+        const auto bitmap = decoder.GetSoftwareBitmapAsync().get();
+
+        OcrEngine engine{nullptr};
+        if (!g_ocrLanguage.empty()) {
+            try {
+                engine = OcrEngine::TryCreateFromLanguage(
+                    winrt::Windows::Globalization::Language(g_ocrLanguage));
+            } catch (const hresult_error&) {
+                engine = nullptr;
+            }
+        }
+        if (!engine) engine = OcrEngine::TryCreateFromUserProfileLanguages();
+        if (!engine) {
+            std::wstring available;
+            for (const auto& language : OcrEngine::AvailableRecognizerLanguages()) {
+                if (!available.empty()) available += L"、";
+                available += language.LanguageTag();
+            }
+            if (available.empty()) available = L"无";
+            json << "{\"ok\":false,\"error\":\""
+                 << JsonEscape(L"系统没有可用的 OCR 语言包。已安装：" + available +
+                               L"。请在「设置 - 时间和语言 - 语言和区域」为中文添加「可选功能 - 光学字符识别」。")
+                 << "\"}";
+        } else {
+            const auto result = engine.RecognizeAsync(bitmap).get();
+            json << "{\"ok\":true,\"language\":\"" << JsonEscape(std::wstring(engine.RecognizerLanguage().LanguageTag()))
+                 << "\",\"width\":" << bitmap.PixelWidth()
+                 << ",\"height\":" << bitmap.PixelHeight() << ",\"lines\":[";
+            bool firstLine = true;
+            for (const auto& line : result.Lines()) {
+                if (!firstLine) json << ",";
+                firstLine = false;
+                json << "{\"text\":\"" << JsonEscape(std::wstring(line.Text())) << "\",\"words\":[";
+                bool firstWord = true;
+                for (const auto& word : line.Words()) {
+                    if (!firstWord) json << ",";
+                    firstWord = false;
+                    const auto box = word.BoundingRect();
+                    json << "{\"t\":\"" << JsonEscape(std::wstring(word.Text()))
+                         << "\",\"x\":" << box.X << ",\"y\":" << box.Y
+                         << ",\"w\":" << box.Width << ",\"h\":" << box.Height << "}";
+                }
+                json << "]}";
+            }
+            json << "]}";
+            recognised = true;
+        }
+    } catch (const hresult_error& error) {
+        json.str(std::string());
+        json << "{\"ok\":false,\"error\":\"" << JsonEscape(std::wstring(error.message())) << "\"}";
+    } catch (...) {
+        json.str(std::string());
+        json << "{\"ok\":false,\"error\":\"OCR failed\"}";
+    }
+
+    const std::string payload = json.str();
+    std::ofstream output(fs::path(g_ocrOutput), std::ios::binary | std::ios::trunc);
+    output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    return recognised ? 0 : 2;
+}
+
 void ParseArguments() {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -1241,6 +1382,11 @@ void ParseArguments() {
             g_cliEngine = value == L"word" ? 3 : (value == L"image" ? 2 : (value == L"auto" ? 0 : 1));
         } else if (arg == L"--screenshot" && i + 1 < argc) {
             g_screenshotPath = argv[++i];
+        } else if (arg == L"--ocr" && i + 2 < argc) {
+            g_ocrImage = argv[++i];
+            g_ocrOutput = argv[++i];
+        } else if (arg == L"--ocr-language" && i + 1 < argc) {
+            g_ocrLanguage = argv[++i];
         }
     }
     LocalFree(argv);
@@ -1250,6 +1396,11 @@ void ParseArguments() {
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     ParseArguments();
+    if (!g_ocrImage.empty() && !g_ocrOutput.empty()) {
+        // The conversion engine calls the executable back in this mode, one
+        // page image at a time.
+        return RunOcrMode();
+    }
     if (g_cliMode) {
         ConversionJob job{nullptr, g_cliInput, g_cliOutput, g_cliEngine};
         std::wstring message;
